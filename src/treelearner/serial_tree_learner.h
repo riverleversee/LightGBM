@@ -231,7 +231,7 @@ class SerialTreeLearner: public TreeLearner {
   /*! \brief config of tree learner*/
   const Config* config_;
   ColSampler col_sampler_;
-  /*! \brief Classic forced-split tree (feature+threshold); null for depth-only files. */
+  /*! \brief Forced-splits JSON root (may be depth-only); classic ForceSplits requires feature+threshold. */
   const Json* forced_split_json_;
   /*! \brief Depth-staged allow-lists parsed from forced-splits JSON root. */
   std::vector<DepthFeatureStage> depth_feature_stages_;

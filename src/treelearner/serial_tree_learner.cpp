@@ -16,12 +16,108 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "cost_effective_gradient_boosting.hpp"
 
 namespace LightGBM {
+
+namespace {
+
+/*! \brief Hard allow-list intersected with interaction constraints; bypasses feature fractions. */
+std::vector<int8_t> ApplyDepthHardCandidateMask(
+    const Dataset* train_data, const Tree* tree, int leaf,
+    const std::vector<int8_t>& hard_candidate_mask,
+    const std::vector<std::vector<int>>& interaction_constraints_vector) {
+  CHECK_EQ(static_cast<int>(hard_candidate_mask.size()), train_data->num_features());
+  std::vector<int8_t> ret = hard_candidate_mask;
+  if (interaction_constraints_vector.empty()) {
+    return ret;
+  }
+  std::vector<std::unordered_set<int>> interaction_constraints;
+  interaction_constraints.reserve(interaction_constraints_vector.size());
+  for (const auto& constraint : interaction_constraints_vector) {
+    interaction_constraints.emplace_back(constraint.begin(), constraint.end());
+  }
+  std::unordered_set<int> allowed_features;
+  std::vector<int> branch_features = tree->branch_features(leaf);
+  allowed_features.insert(branch_features.begin(), branch_features.end());
+  for (const auto& constraint : interaction_constraints) {
+    int num_feat_found = 0;
+    if (branch_features.empty()) {
+      allowed_features.insert(constraint.begin(), constraint.end());
+    }
+    for (int feat : branch_features) {
+      if (constraint.count(feat) == 0) {
+        break;
+      }
+      ++num_feat_found;
+      if (num_feat_found == static_cast<int>(branch_features.size())) {
+        allowed_features.insert(constraint.begin(), constraint.end());
+        break;
+      }
+    }
+  }
+  for (int inner = 0; inner < train_data->num_features(); ++inner) {
+    if (ret[inner] == 0) {
+      continue;
+    }
+    const int real_fidx = train_data->RealFeatureIndex(inner);
+    if (allowed_features.count(real_fidx) == 0) {
+      ret[inner] = 0;
+    }
+  }
+  return ret;
+}
+
+void RebuildDepthFeatureStages(const Json* forced_split_json, const Config* config,
+                               const Dataset* train_data, int num_features,
+                               std::vector<DepthFeatureStage>* stages,
+                               std::vector<int8_t>* union_mask) {
+  stages->clear();
+  union_mask->clear();
+  if (forced_split_json == nullptr || forced_split_json->is_null() ||
+      !ForcedSplitJsonHasDepthConstraints(*forced_split_json)) {
+    return;
+  }
+  const int max_feature_idx = train_data->num_total_features() - 1;
+  *stages = ValidateForcedSplitsWithDepth(config, train_data, max_feature_idx,
+                                          *forced_split_json);
+  if (stages->empty()) {
+    return;
+  }
+  union_mask->assign(num_features, 0);
+  for (const auto& stage : *stages) {
+    for (int i = 0; i < num_features; ++i) {
+      if (stage.inner_mask[i]) {
+        (*union_mask)[i] = 1;
+      }
+    }
+  }
+}
+
+std::vector<int8_t> GetNodeUsedFeatures(
+    ColSampler* col_sampler, const Dataset* train_data, const Tree* tree, int leaf,
+    const std::vector<int8_t>* hard_mask, const Config* config,
+    bool scrub_to_tree_sample, const std::vector<int8_t>& is_feature_used_bytree) {
+  if (hard_mask != nullptr) {
+    return ApplyDepthHardCandidateMask(train_data, tree, leaf, *hard_mask,
+                                       config->interaction_constraints_vector);
+  }
+  std::vector<int8_t> node_used_features = col_sampler->GetByNode(tree, leaf);
+  if (scrub_to_tree_sample) {
+    for (size_t i = 0; i < node_used_features.size(); ++i) {
+      if (is_feature_used_bytree[i] == 0) {
+        node_used_features[i] = 0;
+      }
+    }
+  }
+  return node_used_features;
+}
+
+}  // namespace
 
 SerialTreeLearner::SerialTreeLearner(const Config* config)
     : config_(config), col_sampler_(config), forced_split_json_(nullptr) {
@@ -40,30 +136,15 @@ void SerialTreeLearner::SetForcedSplit(const Json* forced_split_json) {
     return;
   }
   CHECK(train_data_ != nullptr);
-  const int max_feature_idx = train_data_->num_total_features() - 1;
-  depth_feature_stages_ = ParseDepthFeatureConstraints(
-      *forced_split_json, train_data_, max_feature_idx);
-  if (!depth_feature_stages_.empty()) {
-    depth_feature_union_mask_.assign(num_features_, 0);
-    for (const auto& stage : depth_feature_stages_) {
-      for (int i = 0; i < num_features_; ++i) {
-        if (stage.inner_mask[i]) {
-          depth_feature_union_mask_[i] = 1;
-        }
-      }
-    }
-  }
-  if (ForcedSplitNodeHasFeatureAndThreshold(*forced_split_json)) {
-    forced_split_json_ = forced_split_json;
-  } else {
-    // Depth-only (or metadata-only) root: do not run classic ForceSplits BFS.
+  forced_split_json_ = forced_split_json;
+  if (ForcedSplitJsonHasDepthConstraints(*forced_split_json)) {
+    RebuildDepthFeatureStages(forced_split_json_, config_, train_data_, num_features_,
+                              &depth_feature_stages_, &depth_feature_union_mask_);
+  } else if (!ForcedSplitNodeHasFeatureAndThreshold(*forced_split_json)) {
+    Log::Warning(
+        "Forced splits JSON has neither a classic feature/threshold root nor "
+        "depth_feature_constraints; ignoring file");
     forced_split_json_ = nullptr;
-    if (depth_feature_stages_.empty() &&
-        forced_split_json->object_items().count("depth_feature_constraints") == 0) {
-      Log::Warning(
-          "Forced splits JSON has neither a classic feature/threshold root nor "
-          "depth_feature_constraints; ignoring file");
-    }
   }
 }
 
@@ -188,9 +269,16 @@ void SerialTreeLearner::ResetTrainingDataInner(const Dataset* train_data,
   if (cegb_ != nullptr) {
     cegb_->Init();
   }
+  if (forced_split_json_ != nullptr) {
+    RebuildDepthFeatureStages(forced_split_json_, config_, train_data_, num_features_,
+                              &depth_feature_stages_, &depth_feature_union_mask_);
+  }
 }
 
 void SerialTreeLearner::ResetConfig(const Config* config) {
+  if (!depth_feature_stages_.empty()) {
+    CheckDepthConstraintsBackendSupport(config, true);
+  }
   if (config_->num_leaves != config->num_leaves) {
     config_ = config;
     int max_cache_size = 0;
@@ -557,17 +645,10 @@ void SerialTreeLearner::FindBestSplitsFromHistograms(
   std::vector<SplitInfo> larger_best(share_state_->num_threads);
   const std::vector<int8_t>* smaller_hard =
       GetDepthStageMaskForLeaf(tree, smaller_leaf_splits_->leaf_index());
-  std::vector<int8_t> smaller_node_used_features =
-      col_sampler_.GetByNode(tree, smaller_leaf_splits_->leaf_index(), smaller_hard);
-  if (smaller_hard == nullptr) {
-    // GetByNode(fraction_bynode>=1) can mark all features; scrub stage-union
-    // histogram retention so future stages do not leak into early depths.
-    for (int i = 0; i < num_features_; ++i) {
-      if (col_sampler_.is_feature_used_bytree()[i] == 0) {
-        smaller_node_used_features[i] = 0;
-      }
-    }
-  }
+  std::vector<int8_t> smaller_node_used_features = GetNodeUsedFeatures(
+      &col_sampler_, train_data_, tree, smaller_leaf_splits_->leaf_index(),
+      smaller_hard, config_, !depth_feature_stages_.empty() && smaller_hard == nullptr,
+      col_sampler_.is_feature_used_bytree());
   std::vector<int8_t> larger_node_used_features;
   double smaller_leaf_parent_output = GetParentOutput(tree, smaller_leaf_splits_.get());
   double larger_leaf_parent_output = 0;
@@ -577,15 +658,10 @@ void SerialTreeLearner::FindBestSplitsFromHistograms(
   if (larger_leaf_splits_->leaf_index() >= 0) {
     const std::vector<int8_t>* larger_hard =
         GetDepthStageMaskForLeaf(tree, larger_leaf_splits_->leaf_index());
-    larger_node_used_features =
-        col_sampler_.GetByNode(tree, larger_leaf_splits_->leaf_index(), larger_hard);
-    if (larger_hard == nullptr) {
-      for (int i = 0; i < num_features_; ++i) {
-        if (col_sampler_.is_feature_used_bytree()[i] == 0) {
-          larger_node_used_features[i] = 0;
-        }
-      }
-    }
+    larger_node_used_features = GetNodeUsedFeatures(
+        &col_sampler_, train_data_, tree, larger_leaf_splits_->leaf_index(),
+        larger_hard, config_, !depth_feature_stages_.empty() && larger_hard == nullptr,
+        col_sampler_.is_feature_used_bytree());
   }
 
   if (use_subtract && config_->use_quantized_grad) {
@@ -721,7 +797,8 @@ void SerialTreeLearner::FindBestSplitsFromHistograms(
 int32_t SerialTreeLearner::ForceSplits(Tree* tree, int* left_leaf,
                                        int* right_leaf, int *cur_depth) {
   bool abort_last_forced_split = false;
-  if (forced_split_json_ == nullptr) {
+  if (forced_split_json_ == nullptr ||
+      !ForcedSplitNodeHasFeatureAndThreshold(*forced_split_json_)) {
     return 0;
   }
   int32_t result_count = 0;
@@ -1154,14 +1231,10 @@ void SerialTreeLearner::RecomputeBestSplitForLeaf(Tree* tree, int leaf, SplitInf
   OMP_INIT_EX();
 // find splits
   const std::vector<int8_t>* hard_mask = GetDepthStageMaskForLeaf(tree, leaf);
-  std::vector<int8_t> node_used_features = col_sampler_.GetByNode(tree, leaf, hard_mask);
-  if (hard_mask == nullptr) {
-    for (int i = 0; i < num_features_; ++i) {
-      if (col_sampler_.is_feature_used_bytree()[i] == 0) {
-        node_used_features[i] = 0;
-      }
-    }
-  }
+  std::vector<int8_t> node_used_features = GetNodeUsedFeatures(
+      &col_sampler_, train_data_, tree, leaf, hard_mask, config_,
+      !depth_feature_stages_.empty() && hard_mask == nullptr,
+      col_sampler_.is_feature_used_bytree());
 #pragma omp parallel for schedule(static) num_threads(share_state_->num_threads)
   for (int feature_index = 0; feature_index < num_features_; ++feature_index) {
     OMP_LOOP_EX_BEGIN();

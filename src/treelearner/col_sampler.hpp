@@ -10,7 +10,6 @@
 #include <LightGBM/dataset.h>
 #include <LightGBM/meta.h>
 #include <LightGBM/utils/common.h>
-#include <LightGBM/utils/log.h>
 #include <LightGBM/utils/openmp_wrapper.h>
 #include <LightGBM/utils/random.h>
 
@@ -90,53 +89,7 @@ class ColSampler {
     }
   }
 
-  /*!
-   * \brief Apply a hard feature allow-list, then intersect interaction constraints.
-   *        Bypasses feature_fraction / feature_fraction_bynode.
-   */
-  std::vector<int8_t> ApplyHardCandidateMask(
-      const Tree* tree, int leaf, const std::vector<int8_t>& hard_candidate_mask) const {
-    CHECK_EQ(static_cast<int>(hard_candidate_mask.size()), train_data_->num_features());
-    std::vector<int8_t> ret = hard_candidate_mask;
-    if (interaction_constraints_.empty()) {
-      return ret;
-    }
-    std::unordered_set<int> allowed_features;
-    std::vector<int> branch_features = tree->branch_features(leaf);
-    allowed_features.insert(branch_features.begin(), branch_features.end());
-    for (auto constraint : interaction_constraints_) {
-      int num_feat_found = 0;
-      if (branch_features.size() == 0) {
-        allowed_features.insert(constraint.begin(), constraint.end());
-      }
-      for (int feat : branch_features) {
-        if (constraint.count(feat) == 0) {
-          break;
-        }
-        ++num_feat_found;
-        if (num_feat_found == static_cast<int>(branch_features.size())) {
-          allowed_features.insert(constraint.begin(), constraint.end());
-          break;
-        }
-      }
-    }
-    for (int inner = 0; inner < train_data_->num_features(); ++inner) {
-      if (ret[inner] == 0) {
-        continue;
-      }
-      const int real_fidx = train_data_->RealFeatureIndex(inner);
-      if (allowed_features.count(real_fidx) == 0) {
-        ret[inner] = 0;
-      }
-    }
-    return ret;
-  }
-
-  std::vector<int8_t> GetByNode(const Tree* tree, int leaf,
-                                const std::vector<int8_t>* hard_candidate_mask = nullptr) {
-    if (hard_candidate_mask != nullptr) {
-      return ApplyHardCandidateMask(tree, leaf, *hard_candidate_mask);
-    }
+  std::vector<int8_t> GetByNode(const Tree* tree, int leaf) {
     // get interaction constraints for current branch
     std::unordered_set<int> allowed_features;
     if (!interaction_constraints_.empty()) {

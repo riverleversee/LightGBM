@@ -61,7 +61,6 @@ class GBDT : public GBDTBase {
 
   /*!
   * \brief Traverse the tree of forced splits and check that all indices are less than the number of features.
-  *        Also validates depth_feature_constraints when present.
   */
   void CheckForcedSplitFeatures();
 

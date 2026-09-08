@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <queue>
 #include <set>
 #include <string>
 #include <utility>
@@ -173,6 +174,57 @@ inline void CheckDepthConstraintsBackendSupport(const Config* config, bool has_d
   if (config->use_quantized_grad) {
     Log::Fatal("Don't support depth_feature_constraints with use_quantized_grad=true");
   }
+}
+
+/*!
+ * \brief When depth_feature_constraints is present: backend-gate, parse/validate schema,
+ *        and ensure classic nested forced-split features are allowed by the active stage.
+ * \return Parsed stages (empty if depth key absent).
+ */
+inline std::vector<DepthFeatureStage> ValidateForcedSplitsWithDepth(
+    const Config* config, const Dataset* train_data, int max_feature_idx, const Json& root) {
+  if (!ForcedSplitJsonHasDepthConstraints(root)) {
+    return std::vector<DepthFeatureStage>();
+  }
+  CheckDepthConstraintsBackendSupport(config, true);
+  std::vector<DepthFeatureStage> stages =
+      ParseDepthFeatureConstraints(root, train_data, max_feature_idx);
+  std::queue<std::pair<Json, int>> forced_split_nodes;
+  if (ForcedSplitNodeHasFeatureAndThreshold(root)) {
+    forced_split_nodes.push(std::make_pair(root, 0));
+  }
+  while (!forced_split_nodes.empty()) {
+    auto node_depth = forced_split_nodes.front();
+    forced_split_nodes.pop();
+    Json node = node_depth.first;
+    const int depth = node_depth.second;
+    if (!ForcedSplitNodeHasFeatureAndThreshold(node)) {
+      continue;
+    }
+    const int feature_index = node["feature"].int_value();
+    if (feature_index > max_feature_idx) {
+      Log::Fatal(
+          "Forced splits file includes feature index %d, but maximum feature index in dataset is %d",
+          feature_index, max_feature_idx);
+    }
+    const DepthFeatureStage* stage = FindDepthFeatureStage(stages, depth);
+    if (stage != nullptr) {
+      const int inner = train_data->InnerFeatureIndex(feature_index);
+      if (inner < 0 || stage->inner_mask[inner] == 0) {
+        Log::Fatal(
+            "Forced split feature %d is not allowed by depth_feature_constraints "
+            "at leaf_depth=%d",
+            feature_index, depth);
+      }
+    }
+    if (node.object_items().count("left") > 0 && !node["left"].is_null()) {
+      forced_split_nodes.push(std::make_pair(node["left"], depth + 1));
+    }
+    if (node.object_items().count("right") > 0 && !node["right"].is_null()) {
+      forced_split_nodes.push(std::make_pair(node["right"], depth + 1));
+    }
+  }
+  return stages;
 }
 
 }  // namespace LightGBM
