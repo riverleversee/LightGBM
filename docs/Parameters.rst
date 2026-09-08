@@ -631,7 +631,13 @@ Learning Control Parameters
 
    -  **Note**: the forced split logic will be ignored, if the split makes gain worse
 
-   -  see `this file <https://github.com/lightgbm-org/LightGBM/blob/main/examples/binary_classification/forced_splits.json>`__ as an example
+   -  optional root ``depth_feature_constraints``: non-empty array of ``{"min_depth": <non-negative int>, "features": [<non-negative int>, ...]}`` with unique ``min_depth`` values; feature indices are 0-based raw dataset indices
+
+   -  at leaf depth ``d``, the stage with the greatest ``min_depth <= d`` (if any) is the hard allow-list; active stages bypass ``feature_fraction`` / ``feature_fraction_bynode``, then intersect ``interaction_constraints``
+
+   -  depth stages require ``device_type=cpu``, effective ``tree_learner=serial``, and ``use_quantized_grad=false``
+
+   -  see `this file <https://github.com/lightgbm-org/LightGBM/blob/main/examples/binary_classification/forced_splits.json>`__ as an example of classic forced splits, and `depth_feature_constraints.json <https://github.com/lightgbm-org/LightGBM/blob/main/examples/binary_classification/depth_feature_constraints.json>`__ for depth stages
 
 -  ``refit_decay_rate`` :raw-html:`<a id="refit_decay_rate" title="Permalink to this parameter" href="#refit_decay_rate">&#x1F517;&#xFE0E;</a>`, default = ``0.9``, type = double, constraints: ``0.0 <= refit_decay_rate <= 1.0``
 

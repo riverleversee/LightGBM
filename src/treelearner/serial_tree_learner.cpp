@@ -24,11 +24,60 @@
 namespace LightGBM {
 
 SerialTreeLearner::SerialTreeLearner(const Config* config)
-    : config_(config), col_sampler_(config) {
+    : config_(config), col_sampler_(config), forced_split_json_(nullptr) {
   gradient_discretizer_ = nullptr;
 }
 
 SerialTreeLearner::~SerialTreeLearner() {
+}
+
+void SerialTreeLearner::SetForcedSplit(const Json* forced_split_json) {
+  depth_feature_stages_.clear();
+  depth_feature_union_mask_.clear();
+
+  if (forced_split_json == nullptr || forced_split_json->is_null()) {
+    forced_split_json_ = nullptr;
+    return;
+  }
+  CHECK(train_data_ != nullptr);
+  const int max_feature_idx = train_data_->num_total_features() - 1;
+  depth_feature_stages_ = ParseDepthFeatureConstraints(
+      *forced_split_json, train_data_, max_feature_idx);
+  if (!depth_feature_stages_.empty()) {
+    depth_feature_union_mask_.assign(num_features_, 0);
+    for (const auto& stage : depth_feature_stages_) {
+      for (int i = 0; i < num_features_; ++i) {
+        if (stage.inner_mask[i]) {
+          depth_feature_union_mask_[i] = 1;
+        }
+      }
+    }
+  }
+  if (ForcedSplitNodeHasFeatureAndThreshold(*forced_split_json)) {
+    forced_split_json_ = forced_split_json;
+  } else {
+    // Depth-only (or metadata-only) root: do not run classic ForceSplits BFS.
+    forced_split_json_ = nullptr;
+    if (depth_feature_stages_.empty() &&
+        forced_split_json->object_items().count("depth_feature_constraints") == 0) {
+      Log::Warning(
+          "Forced splits JSON has neither a classic feature/threshold root nor "
+          "depth_feature_constraints; ignoring file");
+    }
+  }
+}
+
+const std::vector<int8_t>* SerialTreeLearner::GetDepthStageMaskForLeaf(
+    const Tree* tree, int leaf) const {
+  if (depth_feature_stages_.empty() || leaf < 0) {
+    return nullptr;
+  }
+  const DepthFeatureStage* stage =
+      FindDepthFeatureStage(depth_feature_stages_, tree->leaf_depth(leaf));
+  if (stage == nullptr) {
+    return nullptr;
+  }
+  return &stage->inner_mask;
 }
 
 void SerialTreeLearner::Init(const Dataset* train_data, bool is_constant_hessian) {
@@ -295,7 +344,19 @@ void SerialTreeLearner::BeforeTrain() {
   histogram_pool_.ResetMap();
 
   col_sampler_.ResetByTree();
-  train_data_->InitTrain(col_sampler_.is_feature_used_bytree(), share_state_.get());
+  // Row-wise subcolumn materialization must retain every feature that may become
+  // eligible under a later depth stage, not only the by-tree sample.
+  if (depth_feature_union_mask_.empty()) {
+    train_data_->InitTrain(col_sampler_.is_feature_used_bytree(), share_state_.get());
+  } else {
+    std::vector<int8_t> init_mask = col_sampler_.is_feature_used_bytree();
+    for (int i = 0; i < num_features_; ++i) {
+      if (depth_feature_union_mask_[i]) {
+        init_mask[i] = 1;
+      }
+    }
+    train_data_->InitTrain(init_mask, share_state_.get());
+  }
   // initialize data partition
   data_partition_->Init();
 
@@ -395,9 +456,19 @@ void SerialTreeLearner::FindBestSplits(const Tree* tree, const std::set<int>* fo
   std::vector<int8_t> is_feature_used(num_features_, 0);
   #pragma omp parallel for num_threads(OMP_NUM_THREADS()) schedule(static, 256) if (num_features_ >= 512)
   for (int feature_index = 0; feature_index < num_features_; ++feature_index) {
-    if (!col_sampler_.is_feature_used_bytree()[feature_index] && (force_features == nullptr || force_features->find(feature_index) == force_features->end())) continue;
+    const bool in_tree_sample = col_sampler_.is_feature_used_bytree()[feature_index] != 0;
+    const bool in_force = force_features != nullptr &&
+                          force_features->find(feature_index) != force_features->end();
+    const bool in_stage_union = !depth_feature_union_mask_.empty() &&
+                                depth_feature_union_mask_[feature_index] != 0;
+    if (!in_tree_sample && !in_force && !in_stage_union) {
+      continue;
+    }
     if (parent_leaf_histogram_array_ != nullptr
-        && !parent_leaf_histogram_array_[feature_index].is_splittable()) {
+        && !parent_leaf_histogram_array_[feature_index].is_splittable()
+        && !in_stage_union) {
+      // Non-stage features with no parent gain stay pruned. Stage-union features must
+      // retain parent histograms and be re-evaluated when a later stage activates.
       smaller_leaf_histogram_array_[feature_index].set_is_splittable(false);
       continue;
     }
@@ -484,7 +555,19 @@ void SerialTreeLearner::FindBestSplitsFromHistograms(
       "SerialTreeLearner::FindBestSplitsFromHistograms", global_timer);
   std::vector<SplitInfo> smaller_best(share_state_->num_threads);
   std::vector<SplitInfo> larger_best(share_state_->num_threads);
-  std::vector<int8_t> smaller_node_used_features = col_sampler_.GetByNode(tree, smaller_leaf_splits_->leaf_index());
+  const std::vector<int8_t>* smaller_hard =
+      GetDepthStageMaskForLeaf(tree, smaller_leaf_splits_->leaf_index());
+  std::vector<int8_t> smaller_node_used_features =
+      col_sampler_.GetByNode(tree, smaller_leaf_splits_->leaf_index(), smaller_hard);
+  if (smaller_hard == nullptr) {
+    // GetByNode(fraction_bynode>=1) can mark all features; scrub stage-union
+    // histogram retention so future stages do not leak into early depths.
+    for (int i = 0; i < num_features_; ++i) {
+      if (col_sampler_.is_feature_used_bytree()[i] == 0) {
+        smaller_node_used_features[i] = 0;
+      }
+    }
+  }
   std::vector<int8_t> larger_node_used_features;
   double smaller_leaf_parent_output = GetParentOutput(tree, smaller_leaf_splits_.get());
   double larger_leaf_parent_output = 0;
@@ -492,7 +575,17 @@ void SerialTreeLearner::FindBestSplitsFromHistograms(
     larger_leaf_parent_output = GetParentOutput(tree, larger_leaf_splits_.get());
   }
   if (larger_leaf_splits_->leaf_index() >= 0) {
-    larger_node_used_features = col_sampler_.GetByNode(tree, larger_leaf_splits_->leaf_index());
+    const std::vector<int8_t>* larger_hard =
+        GetDepthStageMaskForLeaf(tree, larger_leaf_splits_->leaf_index());
+    larger_node_used_features =
+        col_sampler_.GetByNode(tree, larger_leaf_splits_->leaf_index(), larger_hard);
+    if (larger_hard == nullptr) {
+      for (int i = 0; i < num_features_; ++i) {
+        if (col_sampler_.is_feature_used_bytree()[i] == 0) {
+          larger_node_used_features[i] = 0;
+        }
+      }
+    }
   }
 
   if (use_subtract && config_->use_quantized_grad) {
@@ -761,6 +854,15 @@ std::set<int> SerialTreeLearner::FindAllForceFeatures(Json force_split_leaf_sett
 
     if (split_leaf.object_items().count("right") > 0) {
       force_split_leaves.push(split_leaf["right"]);
+    }
+  }
+
+  // Ensure depth-stage features have histograms during a classic forced prefix.
+  for (const auto& stage : depth_feature_stages_) {
+    for (int i = 0; i < num_features_; ++i) {
+      if (stage.inner_mask[i]) {
+        force_features.insert(i);
+      }
     }
   }
 
@@ -1051,11 +1153,22 @@ void SerialTreeLearner::RecomputeBestSplitForLeaf(Tree* tree, int leaf, SplitInf
 
   OMP_INIT_EX();
 // find splits
-std::vector<int8_t> node_used_features = col_sampler_.GetByNode(tree, leaf);
+  const std::vector<int8_t>* hard_mask = GetDepthStageMaskForLeaf(tree, leaf);
+  std::vector<int8_t> node_used_features = col_sampler_.GetByNode(tree, leaf, hard_mask);
+  if (hard_mask == nullptr) {
+    for (int i = 0; i < num_features_; ++i) {
+      if (col_sampler_.is_feature_used_bytree()[i] == 0) {
+        node_used_features[i] = 0;
+      }
+    }
+  }
 #pragma omp parallel for schedule(static) num_threads(share_state_->num_threads)
   for (int feature_index = 0; feature_index < num_features_; ++feature_index) {
     OMP_LOOP_EX_BEGIN();
-    if (!col_sampler_.is_feature_used_bytree()[feature_index] ||
+    // When a depth stage is active, allow stage features even if excluded by feature_fraction.
+    const bool in_tree_sample = col_sampler_.is_feature_used_bytree()[feature_index] != 0;
+    const bool in_depth_stage = hard_mask != nullptr && node_used_features[feature_index] != 0;
+    if ((!in_tree_sample && !in_depth_stage) ||
         !histogram_array_[feature_index].is_splittable()) {
       continue;
     }

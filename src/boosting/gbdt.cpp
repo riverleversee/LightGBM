@@ -24,6 +24,8 @@
 #include <utility>
 #include <vector>
 
+#include "../treelearner/depth_feature_constraints.hpp"
+
 namespace LightGBM {
 
 Common::Timer global_timer;
@@ -168,24 +170,81 @@ void GBDT::Init(const Config* config, const Dataset* train_data, const Objective
   }
 }
 
-void GBDT::CheckForcedSplitFeatures() {
-  std::queue<Json> forced_split_nodes;
-  forced_split_nodes.push(forced_splits_json_);
+namespace {
+
+void ValidateForcedSplitsJson(const Config* config, const Dataset* train_data,
+                              int max_feature_idx, const Json& json) {
+  if (config->forcedsplits_filename.empty() || json.is_null()) {
+    return;
+  }
+  const bool has_depth = ForcedSplitJsonHasDepthConstraints(json);
+  CheckDepthConstraintsBackendSupport(config, has_depth);
+
+  if (!has_depth) {
+    // Classic-only path: preserve legacy feature-index walk.
+    std::queue<Json> forced_split_nodes;
+    forced_split_nodes.push(json);
+    while (!forced_split_nodes.empty()) {
+      Json node = forced_split_nodes.front();
+      forced_split_nodes.pop();
+      const int feature_index = node["feature"].int_value();
+      if (feature_index > max_feature_idx) {
+        Log::Fatal("Forced splits file includes feature index %d, but maximum feature index in dataset is %d",
+          feature_index, max_feature_idx);
+      }
+      if (node.object_items().count("left") > 0) {
+        forced_split_nodes.push(node["left"]);
+      }
+      if (node.object_items().count("right") > 0) {
+        forced_split_nodes.push(node["right"]);
+      }
+    }
+    return;
+  }
+
+  std::vector<DepthFeatureStage> stages =
+      ParseDepthFeatureConstraints(json, train_data, max_feature_idx);
+  // Depth + classic nested forced: ensure nested features are allowed by stages.
+  std::queue<std::pair<Json, int>> forced_split_nodes;
+  if (ForcedSplitNodeHasFeatureAndThreshold(json)) {
+    forced_split_nodes.push(std::make_pair(json, 0));
+  }
   while (!forced_split_nodes.empty()) {
-    Json node = forced_split_nodes.front();
+    auto node_depth = forced_split_nodes.front();
     forced_split_nodes.pop();
+    Json node = node_depth.first;
+    const int depth = node_depth.second;
+    if (!ForcedSplitNodeHasFeatureAndThreshold(node)) {
+      continue;
+    }
     const int feature_index = node["feature"].int_value();
-    if (feature_index > max_feature_idx_) {
+    if (feature_index > max_feature_idx) {
       Log::Fatal("Forced splits file includes feature index %d, but maximum feature index in dataset is %d",
-        feature_index, max_feature_idx_);
+        feature_index, max_feature_idx);
     }
-    if (node.object_items().count("left") > 0) {
-      forced_split_nodes.push(node["left"]);
+    const DepthFeatureStage* stage = FindDepthFeatureStage(stages, depth);
+    if (stage != nullptr) {
+      const int inner = train_data->InnerFeatureIndex(feature_index);
+      if (inner < 0 || stage->inner_mask[inner] == 0) {
+        Log::Fatal(
+            "Forced split feature %d is not allowed by depth_feature_constraints "
+            "at leaf_depth=%d",
+            feature_index, depth);
+      }
     }
-    if (node.object_items().count("right") > 0) {
-      forced_split_nodes.push(node["right"]);
+    if (node.object_items().count("left") > 0 && !node["left"].is_null()) {
+      forced_split_nodes.push(std::make_pair(node["left"], depth + 1));
+    }
+    if (node.object_items().count("right") > 0 && !node["right"].is_null()) {
+      forced_split_nodes.push(std::make_pair(node["right"], depth + 1));
     }
   }
+}
+
+}  // namespace
+
+void GBDT::CheckForcedSplitFeatures() {
+  ValidateForcedSplitsJson(config_.get(), train_data_, max_feature_idx_, forced_splits_json_);
 }
 
 void GBDT::AddValidDataset(const Dataset* valid_data,
@@ -802,6 +861,12 @@ void GBDT::ResetTrainingData(const Dataset* train_data, const ObjectiveFunction*
 
     tree_learner_->ResetTrainingData(train_data, is_constant_hessian_);
     data_sample_strategy_->ResetSampleConfig(config_.get(), true);
+    // Rebuild depth-stage masks against the current Dataset*.
+    if (!config_->forcedsplits_filename.empty() && !forced_splits_json_.is_null()) {
+      tree_learner_->SetForcedSplit(&forced_splits_json_);
+    } else {
+      tree_learner_->SetForcedSplit(nullptr);
+    }
   } else {
     tree_learner_->ResetIsConstantHessian(is_constant_hessian_);
   }
@@ -818,6 +883,31 @@ void GBDT::ResetConfig(const Config* config) {
   if (objective_function_ != nullptr && objective_function_->IsRenewTreeOutput() && !config->monotone_constraints.empty()) {
     Log::Fatal("Cannot use ``monotone_constraints`` in %s objective, please disable it.", objective_function_->GetName());
   }
+
+  // Narrow pre-validation before the learner receives new_config (avoids dangling Config*).
+  const bool forcedsplits_changed =
+      config_.get() != nullptr &&
+      config_->forcedsplits_filename != new_config->forcedsplits_filename;
+  Json pending_forced_json = forced_splits_json_;
+  if (forcedsplits_changed) {
+    if (!new_config->forcedsplits_filename.empty()) {
+      std::ifstream forced_splits_file(new_config->forcedsplits_filename.c_str());
+      std::stringstream buffer;
+      buffer << forced_splits_file.rdbuf();
+      std::string err;
+      pending_forced_json = Json::parse(buffer.str(), &err);
+      if (ForcedSplitJsonHasDepthConstraints(pending_forced_json)) {
+        ValidateForcedSplitsJson(new_config.get(), train_data_, max_feature_idx_,
+                                 pending_forced_json);
+      }
+    } else {
+      pending_forced_json = Json();
+    }
+  } else if (!new_config->forcedsplits_filename.empty() &&
+             ForcedSplitJsonHasDepthConstraints(forced_splits_json_)) {
+    CheckDepthConstraintsBackendSupport(new_config.get(), true);
+  }
+
   early_stopping_round_ = new_config->early_stopping_round;
   shrinkage_rate_ = new_config->learning_rate;
   if (tree_learner_ != nullptr) {
@@ -835,15 +925,10 @@ void GBDT::ResetConfig(const Config* config) {
       ResetGradientBuffers();
     }
   }
-  if (config_.get() != nullptr && config_->forcedsplits_filename != new_config->forcedsplits_filename) {
+  if (forcedsplits_changed) {
     // load forced_splits file
     if (!new_config->forcedsplits_filename.empty()) {
-      std::ifstream forced_splits_file(
-          new_config->forcedsplits_filename.c_str());
-      std::stringstream buffer;
-      buffer << forced_splits_file.rdbuf();
-      std::string err;
-      forced_splits_json_ = Json::parse(buffer.str(), &err);
+      forced_splits_json_ = std::move(pending_forced_json);
       tree_learner_->SetForcedSplit(&forced_splits_json_);
     } else {
       forced_splits_json_ = Json();

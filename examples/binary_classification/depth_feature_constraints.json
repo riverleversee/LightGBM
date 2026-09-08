@@ -1,0 +1,18 @@
+{
+    "depth_feature_constraints": [
+        {
+            "min_depth": 2,
+            "features": [
+                0,
+                1
+            ]
+        },
+        {
+            "min_depth": 3,
+            "features": [
+                2,
+                3
+            ]
+        }
+    ]
+}

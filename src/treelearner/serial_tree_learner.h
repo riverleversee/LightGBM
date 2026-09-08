@@ -24,6 +24,7 @@
 
 #include "col_sampler.hpp"
 #include "data_partition.hpp"
+#include "depth_feature_constraints.hpp"
 #include "feature_histogram.hpp"
 #include "gradient_discretizer.hpp"
 #include "leaf_splits.hpp"
@@ -70,13 +71,7 @@ class SerialTreeLearner: public TreeLearner {
 
   void ResetConfig(const Config* config) override;
 
-  inline void SetForcedSplit(const Json* forced_split_json) override {
-    if (forced_split_json != nullptr && !forced_split_json->is_null()) {
-      forced_split_json_ = forced_split_json;
-    } else {
-      forced_split_json_ = nullptr;
-    }
-  }
+  void SetForcedSplit(const Json* forced_split_json) override;
 
   Tree* Train(const score_t* gradients, const score_t *hessians, bool is_first_tree) override;
 
@@ -172,6 +167,9 @@ class SerialTreeLearner: public TreeLearner {
 
   std::set<int> FindAllForceFeatures(Json force_split_leaf_setting);
 
+  /*! \brief Active depth-stage mask for a leaf, or nullptr if unconstrained. */
+  const std::vector<int8_t>* GetDepthStageMaskForLeaf(const Tree* tree, int leaf) const;
+
   #ifdef DEBUG
   void CheckSplit(const SplitInfo& best_split_info, const int left_leaf_index, const int right_leaf_index);
   #endif
@@ -233,7 +231,12 @@ class SerialTreeLearner: public TreeLearner {
   /*! \brief config of tree learner*/
   const Config* config_;
   ColSampler col_sampler_;
+  /*! \brief Classic forced-split tree (feature+threshold); null for depth-only files. */
   const Json* forced_split_json_;
+  /*! \brief Depth-staged allow-lists parsed from forced-splits JSON root. */
+  std::vector<DepthFeatureStage> depth_feature_stages_;
+  /*! \brief Union of all stage allow-lists (inner indices); used for histograms / InitTrain. */
+  std::vector<int8_t> depth_feature_union_mask_;
   std::unique_ptr<TrainingShareStates> share_state_;
   std::unique_ptr<CostEfficientGradientBoosting> cegb_;
   std::unique_ptr<GradientDiscretizer> gradient_discretizer_;

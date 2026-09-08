@@ -545,7 +545,10 @@ struct Config {
   // desc = ``.json`` file can be arbitrarily nested, and each split contains ``feature``, ``threshold`` fields, as well as ``left`` and ``right`` fields representing subsplits
   // desc = categorical splits are forced in a one-hot fashion, with ``left`` representing the split containing the feature value and ``right`` representing other values
   // desc = **Note**: the forced split logic will be ignored, if the split makes gain worse
-  // desc = see `this file <https://github.com/lightgbm-org/LightGBM/blob/main/examples/binary_classification/forced_splits.json>`__ as an example
+  // desc = optional root ``depth_feature_constraints``: non-empty array of ``{"min_depth": <non-negative int>, "features": [<non-negative int>, ...]}`` with unique ``min_depth`` values; feature indices are 0-based raw dataset indices
+  // desc = at leaf depth ``d``, the stage with the greatest ``min_depth <= d`` (if any) is the hard allow-list; active stages bypass ``feature_fraction`` / ``feature_fraction_bynode``, then intersect ``interaction_constraints``
+  // desc = depth stages require ``device_type=cpu``, effective ``tree_learner=serial``, and ``use_quantized_grad=false``
+  // desc = see `this file <https://github.com/lightgbm-org/LightGBM/blob/main/examples/binary_classification/forced_splits.json>`__ as an example of classic forced splits, and `depth_feature_constraints.json <https://github.com/lightgbm-org/LightGBM/blob/main/examples/binary_classification/depth_feature_constraints.json>`__ for depth stages
   std::string forcedsplits_filename = "";
 
   // check = >=0.0
